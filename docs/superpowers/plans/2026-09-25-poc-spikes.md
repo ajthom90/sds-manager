@@ -19,7 +19,7 @@
 | 10 | Mac + Windows VM + a Samba host (NAS or Ubuntu VM), coordinated by the person |
 | 11 | Mac |
 
-**Verification status of the code in this plan:** the Rust code and tests in Tasks 1–5 were compiled and passed on this Mac (Rust 1.94.0) while writing the plan. The C# code in Tasks 7–9 has **not** been compiled (no Windows toolchain on the Mac); the Windows executor fixes compile errors as they arise and records every deviation in the results document.
+**Verification status of the code in this plan:** the Rust code and tests in Tasks 1–4 and the Rust half of Task 6 were compiled and passed on this Mac (Rust 1.94.0) while writing the plan; the sample PDF (final and draft) passed veraPDF PDF/A-2b validation; the C# bindings were generated from the `spike_ffi` library and the C# names used in Task 8 were checked against them. The C# code in Tasks 7–9 has **not** been compiled (no Windows toolchain on the Mac); the Windows executor fixes compile errors as they arise and records every deviation in the results document.
 
 ## Global Constraints
 
@@ -95,12 +95,12 @@ the product core is written fresh from the spec. Findings live in
 | `pdf-render/` | C — Typst → PDF/A-2b |
 ```
 
-`spikes/Cargo.toml`:
+`spikes/Cargo.toml` (Tasks 4 and 6 add `pdf-render` and `ffi-core`):
 
 ```toml
 [workspace]
 resolver = "3"
-members = ["smb-lock", "pdf-render", "ffi-core"]
+members = ["smb-lock"]
 ```
 
 `spikes/rust-toolchain.toml`:
@@ -122,7 +122,7 @@ winui/SpikeWinUI/obj/
 
 - [ ] **Step 4: Commit**
 
-The workspace does not build yet (members are created in Tasks 1, 4, 5); commit the scaffolding anyway.
+The workspace does not build until Task 1 creates `smb-lock`; commit the scaffolding anyway.
 
 ```bash
 git add spikes
@@ -190,8 +190,6 @@ fn main() {
     std::process::exit(2); // replaced in Task 3
 }
 ```
-
-Temporarily remove the not-yet-existing members from the workspace so it builds: edit `spikes/Cargo.toml` to `members = ["smb-lock"]` (Tasks 4 and 5 add the others back).
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -864,7 +862,7 @@ Subcommands: `init`, `run` (randomized workload with the protocol, or without it
 - Produces (used by Tasks 6 and 10): binary `smbstress` with
   - `smbstress init --db <path>`
   - `smbstress run --db <path> --client <name> --log-dir <local dir> [--secs 60] [--write-ratio 0.3] [--stale-secs 30] [--no-app-lock] [--no-read-validation]` → prints a JSON `RunReport` (fields `client, machine, secs, writes, write_errors, lost_lock_before_commit, read_violations{bad_total,bad_checksum}, lock{acquired,waits,stale_breaks,timeouts}, read{reads,retries,gave_up,errors}`), writes `<log-dir>/<client>.committed` and `<client>.report.json`; exit 1 if any read violation or write error.
-  - `smbstress crash --db <path> --client <name>` → exits abnormally, leaving the lock file and a hot journal.
+  - `smbstress crash --db <path> --client <name>` → with a 16 KiB page cache, starts a transaction that updates an account and inserts 200 × 2 KB ledger rows (forcing dirty pages to spill into the database file), then aborts — leaving the lock file, a hot journal, and real partial writes for another client to roll back.
   - `smbstress verify --db <path> --log-dirs <dir>...` → prints `{"ok", "integrity_ok", "violations", "logged_commits", "missing_commits"}`; exit 0 only if ok.
 
 - [ ] **Step 1: Write the failing tests**
@@ -919,6 +917,10 @@ fn crashed_writer_is_recovered() {
     let crash = smbstress(&["crash", "--db", s(&db), "--client", "doomed"]);
     assert!(!crash.status.success());
     assert!(smbstress::lock::lock_path(&db).exists(), "crash must leave the lock file behind");
+    let journal = std::path::PathBuf::from(format!("{}-journal", db.display()));
+    assert!(journal.exists(), "crash must leave a hot journal behind");
+    let size_after_crash = std::fs::metadata(&db).unwrap().len();
+    assert!(size_after_crash > 100 * 4096, "dirty pages should have spilled into the db file, size = {size_after_crash}");
     let run = smbstress(&["run", "--db", s(&db), "--client", "survivor", "--log-dir", s(&logs), "--secs", "6", "--stale-secs", "2", "--write-ratio", "0.5"]);
     assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stdout));
     let report: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
@@ -1013,8 +1015,16 @@ fn main() {
             let me = LockInfo::new(&client, &machine());
             let _lock = WriteLock::acquire(&db, &me, &LockConfig::default(), &mut LockStats::default()).expect("lock");
             let conn = workload::open(&db).expect("open");
-            conn.execute_batch("BEGIN IMMEDIATE; UPDATE account SET balance = balance - 999 WHERE id = 0;").expect("half write");
-            eprintln!("aborting with lock held and transaction open");
+            // A tiny page cache forces SQLite to spill dirty pages into the database file
+            // mid-transaction, so the abort leaves real partial writes for another client's
+            // hot-journal rollback to undo (not just an untouched file plus a journal).
+            conn.execute_batch("PRAGMA cache_size=-16; BEGIN IMMEDIATE; UPDATE account SET balance = balance - 999 WHERE id = 0;").expect("half write");
+            let payload = "x".repeat(2048);
+            conn.execute("INSERT INTO txn(id, client, n_rows, checksum) VALUES ('crash', ?1, 200, 'none')", [&client]).expect("crash txn row");
+            for seq in 0..200 {
+                conn.execute("INSERT INTO ledger(txn_id, seq, payload) VALUES ('crash', ?1, ?2)", rusqlite::params![seq, payload]).expect("spill rows");
+            }
+            eprintln!("aborting with lock held, transaction open and dirty pages spilled");
             std::process::abort();
         }
         Cmd::Verify { db, log_dirs } => verify(db, log_dirs),
@@ -1122,7 +1132,7 @@ for i in 1 2 3; do ./target/release/smbstress run --db "$D/t.sdsdb" --client c$i
 ./target/release/smbstress verify --db "$D/t.sdsdb" --log-dirs "$D/logs"
 ```
 
-Expected on local APFS: `"ok":true` (local POSIX locks are reliable, so no violations even without the protocol). Record the output; this is the baseline for the SMB control runs in Task 10.
+Expected on local APFS: `verify` prints `"ok":true` and no client reports `read_violations` (local POSIX locks are reliable, so the data stays consistent even without the protocol). Clients may report a few `write_errors` (SQLite `database is locked` after the 10 s busy timeout, since three writers contend without the app lock) and therefore exit 1 — that is expected here; the pass signal is `verify`. Record the output; it is the baseline for the SMB control runs in Task 10.
 
 - [ ] **Step 6: Commit**
 
@@ -1876,7 +1886,7 @@ Install Claude Code on the VM (per its current Windows install instructions) and
 - [ ] **Step 3: Clone and build natively**
 
 ```powershell
-git clone <repo-url> C:\src\sds-manager
+git clone https://github.com/ajthom90/sds-manager.git C:\src\sds-manager
 cd C:\src\sds-manager
 git checkout spike/poc
 cd spikes
@@ -2251,7 +2261,7 @@ public sealed class PdfPrinter
 cd C:\src\sds-manager\spikes\winui\SpikeWinUI
 dotnet build -c Release -r win-arm64 -p:Platform=ARM64
 $exe = Get-ChildItem -Recurse bin -Filter SpikeWinUI.exe | Where-Object FullName -match "win-arm64" | Select-Object -First 1
-& $exe.FullName --selftest "$env:TEMP\selftest-arm64-rust.json" | Out-Null; $LASTEXITCODE
+$p = Start-Process -FilePath $exe.FullName -ArgumentList "--selftest","$env:TEMP\selftest-arm64-rust.json" -Wait -PassThru; $p.ExitCode
 Get-Content "$env:TEMP\selftest-arm64-rust.json"
 ```
 
@@ -2262,12 +2272,13 @@ Expected: exit code `0`; every entry `"Ok": true`; "process architecture" says `
 ```powershell
 dotnet build -c Release -r win-x64 -p:Platform=x64
 $exe = Get-ChildItem -Recurse bin -Filter SpikeWinUI.exe | Where-Object FullName -match "win-x64" | Select-Object -First 1
-& $exe.FullName --selftest "$env:TEMP\selftest-x64-rust.json" | Out-Null; $LASTEXITCODE
+$p = Start-Process -FilePath $exe.FullName -ArgumentList "--selftest","$env:TEMP\selftest-x64-rust.json" -Wait -PassThru; $p.ExitCode
 
 foreach ($p in @(@{rid="win-arm64";plat="ARM64"}, @{rid="win-x64";plat="x64"})) {
   dotnet build -c Release -r $p.rid -p:Platform=$($p.plat) -p:NativeSource=mac
   $exe = Get-ChildItem -Recurse bin -Filter SpikeWinUI.exe | Where-Object FullName -match $p.rid | Select-Object -First 1
-  & $exe.FullName --selftest "$env:TEMP\selftest-$($p.rid)-mac.json" | Out-Null; "$($p.rid) mac-built: $LASTEXITCODE"
+  $proc = Start-Process -FilePath $exe.FullName -ArgumentList "--selftest","$env:TEMP\selftest-$($p.rid)-mac.json" -Wait -PassThru
+  "$($p.rid) mac-built: $($proc.ExitCode)"
 }
 ```
 
@@ -2407,6 +2418,8 @@ git push
 ### Task 10: Spike A on real SMB shares
 
 Two server types (spec §4.1): a **Windows-hosted share** (on the VM) and a **Samba share** (a NAS if one is available, otherwise an Ubuntu Server VM). Clients: 2 processes on the Mac + 2 on the Windows VM, all against the same file. Database path deliberately contains spaces and non-ASCII characters.
+
+**Runtime parameters:** `<vm-user>`, `<vm-ip>`, `<vm-name>`, `<user>`, `<samba-ip>` are the actual account names, addresses and computer names of the machines used (recorded in Task 7 Step 1 and Step 2 below); `<share>` is `winshare` or `samba` for the run in progress. Substitute them when running the commands; everything else is literal.
 
 **Files:**
 - Create: `spikes/smb-lock/results/<share>/…` (client reports, verify output — committed for the record)
