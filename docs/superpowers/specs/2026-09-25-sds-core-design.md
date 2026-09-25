@@ -98,7 +98,7 @@ Order: 0 → 1 → 2 → (3 ∥ 4) → 5. Sub-projects 3 and 4 may start once th
 
 | Spike | Pass criterion | If it fails |
 |---|---|---|
-| **A. SQLite + lock-file on SMB** | 3+ clients (at least one macOS, one Windows) run randomized read/write/check-out load against one `.sdsdb` on an SMB2/3 share for ≥ 60 minutes; `PRAGMA integrity_check` = ok; no lost committed writes; stale-lock recovery works when a client is killed mid-transaction | Switch storage design to a folder of per-user change files ("change-log folder") before core work starts; re-spec §6 |
+| **A. SQLite + lock-file on SMB** | 3+ clients (at least one macOS, one Windows) run randomized read/write/check-out load against one `.sdsdb` for ≥ 60 minutes, **on each of: a Windows-hosted share and a Samba (Linux/NAS) share** (create-exclusive, rename and delete of open files behave differently on each). Passes when: `PRAGMA integrity_check` = ok; no lost committed writes; **readers never observe a state that was not a committed transaction** (checked with an invariant, e.g. rows carrying a checksum of their transaction's full write set); stale-lock recovery works when a client is killed mid-transaction | Switch storage design to a folder of per-user change files ("change-log folder") before core work starts; re-spec §6 |
 | **B. Rust core ↔ WinUI 3** | A UniFFI-exported object with methods, records, errors and a callback interface is called from a WinUI 3 app on Windows arm64 (native) and x64 (under emulation); binaries cross-built from macOS link and load | Use the C ABI fallback (§3) |
 | **C. Typst PDF rendering** | Embedded Typst renders a sample SDS with Latin, Greek and Cyrillic text, a pictogram row, a multi-page table, "Page X of Y" headers, and outputs **PDF/A-2b** that passes veraPDF validation; identical input → byte-identical output | Evaluate `krilla` (direct PDF) or `printpdf` + own layout |
 | **D. Printing on Windows** | A multi-page PDF prints with correct page count and scaling via WinUI 3 `PrintManager` (interop) on x64 and arm64 | Print via WebView2's built-in PDF viewer |
@@ -140,7 +140,8 @@ setting.
 
 - **`db_meta`**: schema version, database UUID, `min_reference_version` (§6.3), created-at.
 - **`company_settings`**: company time zone, logo (PNG/SVG blob), enabled profiles, enabled output languages
-  per profile, `approval_required` (bool; default true for new shared DBs, false for single-user), Canada output mode
+  per profile, `approval_required` (bool; asked when the database is created — "Will more than one person use this
+database?" — and changeable later by an Admin), Canada output mode
   (`bilingual_combined` | `separate`), optional Section 16 disclaimer text (per language).
 - **`supplier_entity`**: legal name, address, phone, email, VAT number (EU, used for UFI), and which profiles it
   serves (e.g. US importer, Canadian supplier, EU supplier).
@@ -192,7 +193,7 @@ setting.
     composition, substances, classification, texts, company/supplier data, profile ID + version, reference data
     version, engine version), the exact phrase texts used, and the rendered PDFs (one per output document) with
     SHA-256 hashes.
-- **`checkout`**, **`session`**: see §7.
+- **`checkout`**, **`checkout_draft`**, **`session`**: see §7.
 - **`revision_trigger`**: product × profile flagged because an input changed after the last publish (e.g. an
   ingredient's classification changed), with the detected change and the profile's revision deadline.
 
@@ -237,9 +238,19 @@ locations.
 
 ### 7.3 Reads
 
-Reads use short SQLite read transactions without the app lock. `SQLITE_BUSY`, `SQLITE_CORRUPT` or I/O errors during
-a read are retried with backoff (up to 5 attempts) before surfacing `Io`/`Corrupt`. Clients poll the database file's
-change counter (header offset 24) every 3 s while idle; a change triggers a change notification (§9.3).
+Reads use short SQLite read transactions without the app lock. Because SQLite's shared/exclusive locks cannot be
+trusted on SMB, and in rollback-journal mode a writer modifies pages in place, a reader could otherwise see a mix of
+old and new pages **without any error**. Every read transaction is therefore **validated**:
+
+1. Before `BEGIN`: if `company.sdsdb.writelock` exists, wait (same backoff as §7.2); otherwise read the file change
+   counter (header offset 24) directly from the file, bypassing SQLite's cache.
+2. Run the read transaction.
+3. After it ends: if the write-lock file now exists or the change counter differs from step 1, discard the result
+   and retry.
+
+`SQLITE_BUSY`, `SQLITE_CORRUPT` or I/O errors during a read are also retried with backoff (up to 5 attempts in total)
+before surfacing `Io`/`Corrupt`. Clients poll the change counter every 3 s while idle; a change triggers a change
+notification (§9.3).
 
 ### 7.4 Check-out (user-facing record lock)
 
@@ -252,8 +263,12 @@ change counter (header offset 24) every 3 s while idle; a change triggers a chan
   (observer's monotonic clock) may be taken over by any user; an Admin may break any check-out at any time. Both are
   audited, and the previous holder's session is told on its next write attempt (`CheckedOut` error with the new
   holder).
-- Edits are held in memory and in a **local recovery file** (per user profile, not on the share), written to the DB
-  on Save, on Check-in, and by autosave every 2 minutes. On startup, leftover recovery files are offered for restore.
+- Edits are held in memory and in a **local recovery file** (per user profile, not on the share, updated every 30 s).
+  **Save** and **Check-in** write the edits to the live records. **Autosave** (every 2 minutes) writes the pending
+  edits as a JSON blob to a `checkout_draft` row attached to the check-out — not to the live records — so the work
+  survives a local machine failure. Other users always see the **last explicitly saved** state. Taking over a stale
+  check-out offers the new holder the orphaned draft to apply or discard. On startup, leftover local recovery files
+  are offered for restore.
 
 ### 7.5 Sessions and network loss
 
@@ -306,8 +321,11 @@ all five families; a schema-validation test loads skeleton profiles for all of t
 
 ### 8.2 Classification engine (`sds-classify`)
 
-Pure, deterministic, no I/O. Formulas in code; thresholds from the profile. Input: composition (concentrations as
-exact or ranges — ranges use the upper bound for hazard calculations unless the profile says otherwise),
+Pure, deterministic, no I/O. Formulas in code; thresholds from the profile. **Single-substance products**
+(`is_substance`) skip the mixture rules: the substance's own resolved classification passes through, followed by
+label derivation (step 5). For mixtures, input: composition (concentrations as exact or ranges — how a range
+enters the calculation, e.g. upper bound, is a profile parameter with `cite: needed` until verified against each
+regulation's guidance),
 ingredient classifications resolved via the profile's source order, product test data, and overrides. Output:
 classifications, label elements, Section 2 notes, and a structured **derivation trace** (each step: rule ID, cited
 parameter, inputs, arithmetic, result).
@@ -344,7 +362,7 @@ to Draft with reviewer comments).
 | Transition | Who | Conditions |
 |---|---|---|
 | Draft → In Review | Author | Validation has no blocking errors |
-| In Review → Approved | Approver (not the submitting author, unless the DB has exactly one active user) | Validation has no blocking errors; classification is current (input hash matches) |
+| In Review → Approved | Approver other than the submitting author | Validation has no blocking errors; classification is current (input hash matches) |
 | In Review → Rejected → Draft | Approver | Comment required |
 | Approved → Published | Author, Approver or Admin | Renders final PDFs, sets revision date (default today), writes the immutable snapshot; previous published revision → Superseded |
 | Draft → Published | Author | Only when `approval_required = false` (records the author as approver) |
@@ -363,7 +381,9 @@ field, language) and message key. Rules come from the profile plus generic check
 
 - Blocking: mandatory field empty; required language translation missing; trade-secret range not permitted by
   profile; required supplier/emergency contact missing; EU hazardous mixture without UFI; classification stale
-  relative to inputs; unresolved required user decision (e.g. pH flag).
+  relative to inputs; unresolved required user decision (e.g. pH flag); composition impossible (sum of exact values
+  and range minimums > 100 %).
+- Warning: composition incomplete (exact values do not total 100 % ± 0.5, or range maximums total < 100 %).
 - Warning: more P-statements than the profile's guidance; an ingredient classification taken from an unverified
   suggestion source; exposure limits absent in Section 8 for an ingredient with a hazard classification.
 
