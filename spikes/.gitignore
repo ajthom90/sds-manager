@@ -1,0 +1,5 @@
+target/
+out/
+pdf-render/assets/fonts/
+winui/SpikeWinUI/bin/
+winui/SpikeWinUI/obj/
