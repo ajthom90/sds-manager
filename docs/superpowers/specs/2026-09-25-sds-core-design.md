@@ -44,7 +44,7 @@ responsible person reviews and approves every SDS.
 | Classification | **Automatic mixture classification** with recorded, justified overrides |
 | Ingredient data | **Bundled starter library** from public/reusable sources + optional online PubChem lookup |
 | Languages | Official phrases auto-filled in every language; free text stored per language; publishing blocked when a required translation is missing; standard-sentence library (EN + FR first) |
-| Users | Identified by OS login name (no passwords); roles Author / Approver / Admin; approval workflow; audit log |
+| Users | Identified by OS login name (no passwords); roles Viewer / Author / Approver / Admin (new users on a shared DB start as Viewer); approval workflow; audit log |
 | Output | PDF (PDF/A-2b) export and printing |
 | License | Open source, permissive: **MIT OR Apache-2.0** dual license (Rust-ecosystem convention; compatible with Typst (Apache-2.0) and Noto fonts (OFL)) |
 
@@ -146,9 +146,10 @@ database?" — and changeable later by an Admin), Canada output mode
 - **`supplier_entity`**: legal name, address, phone, email, VAT number (EU, used for UFI), and which profiles it
   serves (e.g. US importer, Canadian supplier, EU supplier).
 - **`emergency_contact`**: phone number, hours, language notes, per profile.
-- **`user`**: OS login name (unique, case-insensitive), display name, roles (set of `Author`, `Approver`, `Admin`),
+- **`user`**: OS login name (unique, case-insensitive), display name, roles (set of `Viewer`, `Author`, `Approver`, `Admin`),
   active flag. The first user to create a database becomes Admin. Unknown OS users opening a shared DB are added with
-  `Author` role (Admins can change this).
+  the `Viewer` role and see a notice that an Admin must grant Author/Approver rights to edit; the audit log records
+  their first access.
 - **`audit_log`** (append-only): timestamp, user, machine, session ID, entity type, entity ID, action, JSON diff
   (before/after of changed fields).
 - **`substance`** (company-owned): identifiers (CAS RN — user-entered, EC number, index number, PubChem CID,
@@ -371,7 +372,8 @@ A new revision is created by copying the current published revision's inputs int
 Revision triggers (§6.2) list products whose published SDS is out of date with the deadline from the profile.
 
 **Permissions** are enforced in the core (Admin: settings, users, lock breaking, restore; Approver: approve/reject;
-Author: edit, submit, publish-approved). Because the DB is a file readable by anyone with share access, roles are
+Author: edit, submit, publish-approved; Viewer: browse products and substances, preview, export and print
+**published** SDSs only — no check-outs, no drafts; attempts return `ReadOnly { NoPermission }`). Because the DB is a file readable by anyone with share access, roles are
 an accountability mechanism, not security; the spec and UI say so.
 
 ### 8.4 Validation
