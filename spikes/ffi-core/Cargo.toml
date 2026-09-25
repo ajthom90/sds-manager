@@ -1,0 +1,13 @@
+[package]
+name = "spike-ffi"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "spike_ffi"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+thiserror = "2"
+uniffi = "=0.31.0"
