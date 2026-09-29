@@ -15,8 +15,8 @@
 | Tasks | Machine |
 |---|---|
 | 0–6 | This Mac (Apple Silicon) |
-| 7–9 | Windows 11 ARM VM with Claude Code installed |
-| 10 | Mac + Windows VM + a Samba host (NAS or Ubuntu VM), coordinated by the person |
+| 7–9 | Windows 11 ARM VM with Claude Code installed (development machine); plus a Windows x64 VM on the person's Hyper-V server for native-x64 runs (Task 8 Step 5, Task 9 Step 3) — no tools needed there |
+| 10 | Mac + Windows ARM VM + Windows x64 Hyper-V VM (hosts the Windows share) + the person's NAS (Samba), coordinated by the person |
 | 11 | Mac |
 
 **Verification status of the code in this plan:** the Rust code and tests in Tasks 1–4 and the Rust half of Task 6 were compiled and passed on this Mac (Rust 1.94.0) while writing the plan; the sample PDF (final and draft) passed veraPDF PDF/A-2b validation; the C# bindings were generated from the `spike_ffi` library and the C# names used in Task 8 were checked against them. The C# code in Tasks 7–9 has **not** been compiled (no Windows toolchain on the Mac); the Windows executor fixes compile errors as they arise and records every deviation in the results document.
@@ -2284,7 +2284,20 @@ foreach ($p in @(@{rid="win-arm64";plat="ARM64"}, @{rid="win-x64";plat="x64"})) 
 
 Expected: all exit codes `0`; x64 runs report `X64 process on Arm64 OS`. Copy the four JSON files to `spikes/winui/results/` for the record.
 
-- [ ] **Step 5: Commit (on the VM)**
+- [ ] **Step 5: Native x64 run on the Hyper-V x64 VM**
+
+The build is self-contained (`SelfContained` + `WindowsAppSDKSelfContained`), so the x64 VM needs no SDKs. Copy the whole output folder of each x64 build (the directory containing `SpikeWinUI.exe`, once built with the Rust-on-Windows DLL and once with `-p:NativeSource=mac`) to the x64 VM, e.g. `C:\spike\x64-rust\` and `C:\spike\x64-mac\`. On the x64 VM:
+
+```powershell
+foreach ($v in "x64-rust","x64-mac") {
+  $p = Start-Process -FilePath "C:\spike\$v\SpikeWinUI.exe" -ArgumentList "--selftest","C:\spike\selftest-$v-native.json" -Wait -PassThru
+  "$v native: $($p.ExitCode)"
+}
+```
+
+Expected: both exit codes `0`; "process architecture" says `X64 process on X64 OS`. If the app fails to start, record the error (Event Viewer → Windows Logs → Application) — a missing runtime dependency here is a packaging finding for Sub-project 5. Copy both JSON files to `spikes/winui/results/`.
+
+- [ ] **Step 6: Commit (on the VM)**
 
 ```powershell
 git add spikes/winui
@@ -2396,7 +2409,7 @@ Expected: both succeed. Record any compile fixes.
 
 - [ ] **Step 3: Manual print test (the person runs this; the agent records results)**
 
-For each of arm64 and x64 builds:
+For each of: the arm64 build and the x64 build on the ARM VM, **and** the x64 build folder copied to the Hyper-V x64 VM (as in Task 8 Step 5):
 
 1. Launch `SpikeWinUI.exe`, click **Print PDF…**, choose `sample-el.pdf`.
 2. Pass/fail checks in the print dialog: preview shows **4 pages**; page 1 preview shows the header, two pictograms and the start of the table; no crash or exception text in the app log.
@@ -2417,7 +2430,7 @@ git push
 
 ### Task 10: Spike A on real SMB shares
 
-Two server types (spec §4.1): a **Windows-hosted share** (on the VM) and a **Samba share** (a NAS if one is available, otherwise an Ubuntu Server VM). Clients: 2 processes on the Mac + 2 on the Windows VM, all against the same file. Database path deliberately contains spaces and non-ASCII characters.
+Two server types (spec §4.1): a **Windows-hosted share** on the **Hyper-V x64 VM** (a separate machine, so every client goes over the network) and a **Samba share** on the person's **NAS**. Clients, all against the same file: 2 processes on the Mac (`mac1`, `mac2`), 1 on the Windows ARM VM (`win-arm`, natively built `smbstress.exe`), 1 on the Hyper-V x64 VM (`win-x64`, the Mac-cross-built `spikes\winui\native-from-mac\win-x64\smbstress.exe` — copy it over; this also exercises that binary on real x64). Database path deliberately contains spaces and non-ASCII characters.
 
 **Runtime parameters:** `<vm-user>`, `<vm-ip>`, `<vm-name>`, `<user>`, `<samba-ip>` are the actual account names, addresses and computer names of the machines used (recorded in Task 7 Step 1 and Step 2 below); `<share>` is `winshare` or `samba` for the run in progress. Substitute them when running the commands; everything else is literal.
 
@@ -2427,7 +2440,7 @@ Two server types (spec §4.1): a **Windows-hosted share** (on the VM) and a **Sa
 **Interfaces:**
 - Consumes: `smbstress` CLI (Task 3); Windows binaries from Task 6 (`native-from-mac`) or Task 7 (native).
 
-- [ ] **Step 1: Windows-hosted share (elevated PowerShell on the VM)**
+- [ ] **Step 1: Windows-hosted share (elevated PowerShell on the Hyper-V x64 VM)**
 
 ```powershell
 New-Item -ItemType Directory -Force "C:\sdsspike\spike a" | Out-Null
@@ -2438,7 +2451,7 @@ On the Mac:
 
 ```bash
 mkdir -p ~/mnt/winshare
-mount_smbfs "//<vm-user>@<vm-ip>/sdsspike" ~/mnt/winshare
+mount_smbfs "//<vm-user>@<vm-ip>/sdsspike" ~/mnt/winshare   # <vm-*> = the Hyper-V x64 VM
 ```
 
 - [ ] **Step 2: Samba share**
@@ -2465,28 +2478,31 @@ Record server OS/versions (Windows build, `smbd --version`) and the negotiated S
 
 - [ ] **Step 3: For each share, run the sensitivity control (10 min, no protocol)**
 
-Paths (per share): Mac `DB=~/mnt/winshare/"spike a"/"Société test.sdsdb"` (or `~/mnt/samba/...`); Windows `$db = "\\<vm-name>\sdsspike\spike a\Société test.sdsdb"` (or `S:\spike a\Société test.sdsdb`). Logs go to a **local** directory on each machine.
+Paths (per share): Mac `DB=~/mnt/winshare/"spike a"/"Société test.sdsdb"` (or `~/mnt/samba/...`); Windows `$db = "\\<vm-name>\sdsspike\spike a\Société test.sdsdb"` with `<vm-name>` = the Hyper-V x64 VM (or `S:\spike a\Société test.sdsdb` for the NAS, after `net use S:` on each Windows VM). Logs go to a **local** directory on each machine. On each Windows VM set `$exe` to that machine's binary: ARM VM `C:\src\sds-manager\spikes\target\aarch64-pc-windows-msvc\release\smbstress.exe`; x64 VM `C:\spike\smbstress.exe` (the copied Mac-cross-built x64 binary).
 
 ```bash
 # Mac: fresh DB, then two clients
 cd /Users/ajthom90/projects/sds-manager/spikes && cargo build --release -p smbstress
 rm -f "$DB"; ./target/release/smbstress init --db "$DB"
+mkdir -p ~/sds-spike-logs/<share>-control
 for c in mac1 mac2; do ./target/release/smbstress run --db "$DB" --client $c --log-dir ~/sds-spike-logs/<share>-control --secs 600 --no-app-lock --no-read-validation > ~/sds-spike-logs/<share>-control/$c.out 2> ~/sds-spike-logs/<share>-control/$c.err & done
 ```
 
 ```powershell
-# Windows, started within a few seconds of the Mac clients
-foreach ($c in "win1","win2") { Start-Process -NoNewWindow .\target\aarch64-pc-windows-msvc\release\smbstress.exe -ArgumentList "run","--db","`"$db`"","--client",$c,"--log-dir","C:\sds-spike-logs\<share>-control","--secs","600","--no-app-lock","--no-read-validation" -RedirectStandardOutput "C:\sds-spike-logs\<share>-control\$c.out" -RedirectStandardError "C:\sds-spike-logs\<share>-control\$c.err" }
+# On each Windows VM, started within a few seconds of the Mac clients; $c = "win-arm" on the ARM VM, "win-x64" on the x64 VM
+New-Item -ItemType Directory -Force "C:\sds-spike-logs\<share>-control" | Out-Null
+$c = "win-arm"   # use "win-x64" on the x64 VM
+Start-Process -NoNewWindow $exe -ArgumentList "run","--db","`"$db`"","--client",$c,"--log-dir","C:\sds-spike-logs\<share>-control","--secs","600","--no-app-lock","--no-read-validation" -RedirectStandardOutput "C:\sds-spike-logs\<share>-control\$c.out" -RedirectStandardError "C:\sds-spike-logs\<share>-control\$c.err"
 ```
 
-After all four finish, copy the Windows log directory to the Mac and run `smbstress verify --db "$DB" --log-dirs <mac-logs> <windows-logs>`. Record per client: `read_violations`, `write_errors`, and the verify output. **Interpretation:** violations or corruption here show the test is sensitive enough to detect the failure the protocol must prevent; zero violations means the protocol run's clean result is weaker evidence — say so in the results.
+After all four finish, copy both Windows log directories to the Mac and run `smbstress verify --db "$DB" --log-dirs <mac-logs> <windows-logs>`. Record per client: `read_violations`, `write_errors`, and the verify output. **Interpretation:** violations or corruption here show the test is sensitive enough to detect the failure the protocol must prevent; zero violations means the protocol run's clean result is weaker evidence — say so in the results.
 
 - [ ] **Step 4: For each share, the protocol run (60 min) with crash injection**
 
-Same commands as Step 3 with a fresh DB, `--secs 3600`, log dir `<share>-protocol`, and **without** the two `--no-…` flags. Then:
+Same commands as Step 3 (including the `mkdir` / `New-Item` for the new log directories) with a fresh DB, `--secs 3600`, log dir `<share>-protocol`, and **without** the two `--no-…` flags. Then:
 
 - at ~20 min, on the Mac: `./target/release/smbstress crash --db "$DB" --client crash-mac`
-- at ~40 min, on Windows: `.\target\aarch64-pc-windows-msvc\release\smbstress.exe crash --db "$db" --client crash-win`
+- at ~40 min, on the Windows x64 VM: `& $exe crash --db "$db" --client crash-win`
 
 After all clients finish: `smbstress verify` as in Step 3.
 
