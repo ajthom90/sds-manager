@@ -2286,7 +2286,7 @@ Expected: all exit codes `0`; x64 runs report `X64 process on Arm64 OS`. Copy th
 
 - [ ] **Step 5: Native x64 run on the Hyper-V x64 VM**
 
-The build is self-contained (`SelfContained` + `WindowsAppSDKSelfContained`), so the x64 VM needs no SDKs. Copy the whole output folder of each x64 build (the directory containing `SpikeWinUI.exe`, once built with the Rust-on-Windows DLL and once with `-p:NativeSource=mac`) to the x64 VM, e.g. `C:\spike\x64-rust\` and `C:\spike\x64-mac\`. On the x64 VM:
+The build is self-contained (`SelfContained` + `WindowsAppSDKSelfContained`), so the x64 VM needs no SDKs. Copy the whole output folder of each x64 build (the directory containing `SpikeWinUI.exe`, once built with the Rust-on-Windows DLL and once with `-p:NativeSource=mac`; both builds write to the same `bin` folder, so copy it right after each build in Step 4) to the x64 VM, e.g. `C:\spike\x64-rust\` and `C:\spike\x64-mac\`. On the x64 VM:
 
 ```powershell
 foreach ($v in "x64-rust","x64-mac") {
